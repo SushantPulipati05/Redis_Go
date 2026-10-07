@@ -9,7 +9,7 @@ import (
 )
 
 func main() {
-	// Open TCP port 6380 (real Redis uses 6379, so we avoid clashing with it).
+
 	listener, err := net.Listen("tcp", ":6380")
 	if err != nil {
 		log.Fatal(err)
@@ -17,10 +17,11 @@ func main() {
 	defer listener.Close()
 	fmt.Println("listening on :6380")
 
-	// One shared database for all clients.
 	store := NewStore()
 
-	// Accept loop: keep waiting for new clients forever.
+	// Background goroutine that deletes expired keys nobody reads again.
+	go store.RunActiveExpiry()
+
 	for {
 		conn, err := listener.Accept()
 		if err != nil {

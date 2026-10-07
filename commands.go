@@ -2,38 +2,13 @@ package main
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
-	"sync"
+	"time"
 )
 
-// Store is the actual database: a map from key to value.
-//
-// Many client goroutines use it at the same time, and Go maps are NOT safe
-// for concurrent writes (two goroutines writing at once can crash the program).
-// So every access goes through a lock:
-//   - RLock: many readers at once are fine (GET, GET, GET...)
-//   - Lock:  a writer gets exclusive access (SET waits for readers to finish)
-type Store struct {
-	mu   sync.RWMutex
-	data map[string]string
-}
-
-func NewStore() *Store {
-	return &Store{data: make(map[string]string)}
-}
-
-func (s *Store) Get(key string) (string, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	val, ok := s.data[key]
-	return val, ok
-}
-
-func (s *Store) Set(key, val string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.data[key] = val
-}
+// The database itself (Store) lives in store.go.
+// This file turns parsed commands into calls on the Store and builds replies.
 
 // A command handler receives the arguments (everything after the command name)
 // and returns the reply to send back.
@@ -45,6 +20,13 @@ var commands = map[string]commandFunc{
 	"ECHO":    cmdEcho,
 	"SET":     cmdSet,
 	"GET":     cmdGet,
+	"DEL":     cmdDel,
+	"EXISTS":  cmdExists,
+	"EXPIRE":  cmdExpire,
+	"PEXPIRE": cmdPExpire,
+	"TTL":     cmdTTL,
+	"PTTL":    cmdPTTL,
+	"PERSIST": cmdPersist,
 	"COMMAND": cmdCommand,
 }
 
@@ -72,10 +54,30 @@ func dispatch(s *Store, v Value) Value {
 	return handler(s, parts[1:])
 }
 
-// Same error text as real Redis, so differential testing can compare replies later.
+// ---------- Shared error replies (same text as real Redis) ----------
+
 func wrongArgs(cmd string) Value {
 	return Err(fmt.Sprintf("ERR wrong number of arguments for '%s' command", strings.ToLower(cmd)))
 }
+
+var (
+	errSyntax = Err("ERR syntax error")
+	errNotInt = Err("ERR value is not an integer or out of range")
+)
+
+func errInvalidExpire(cmd string) Value {
+	return Err(fmt.Sprintf("ERR invalid expire time in '%s' command", cmd))
+}
+
+// boolInt converts true/false to the 1/0 integers Redis uses for yes/no replies.
+func boolInt(b bool) Value {
+	if b {
+		return Int(1)
+	}
+	return Int(0)
+}
+
+// ---------- Basic commands ----------
 
 // PING -> PONG,  PING hello -> "hello"
 func cmdPing(s *Store, args []string) Value {
@@ -97,16 +99,7 @@ func cmdEcho(s *Store, args []string) Value {
 	return Bulk(args[0])
 }
 
-// SET key value -> OK   (options like EX come on Day 2)
-func cmdSet(s *Store, args []string) Value {
-	if len(args) != 2 {
-		return wrongArgs("set")
-	}
-	s.Set(args[0], args[1])
-	return OK()
-}
-
-// GET key -> value, or (nil) if the key doesn't exist
+// GET key -> value, or (nil) if missing or expired
 func cmdGet(s *Store, args []string) Value {
 	if len(args) != 1 {
 		return wrongArgs("get")
@@ -116,6 +109,132 @@ func cmdGet(s *Store, args []string) Value {
 		return NullBulk()
 	}
 	return Bulk(val)
+}
+
+// SET key value [EX seconds | PX milliseconds] [NX | XX]
+//
+//	SET otp 1234 EX 30   -> expires in 30 seconds
+//	SET lock me NX       -> only if "lock" doesn't exist yet (returns nil if it does)
+//	SET name x XX        -> only if "name" already exists
+func cmdSet(s *Store, args []string) Value {
+	if len(args) < 2 {
+		return wrongArgs("set")
+	}
+	key, val := args[0], args[1]
+
+	var ttl time.Duration
+	hasTTL := false
+	cond := SetAlways
+
+	// Walk through the options after key and value.
+	for i := 2; i < len(args); i++ {
+		switch strings.ToUpper(args[i]) {
+		case "EX", "PX":
+			if hasTTL || i+1 >= len(args) {
+				return errSyntax // EX given twice, EX+PX together, or no number after it
+			}
+			n, err := strconv.ParseInt(args[i+1], 10, 64)
+			if err != nil {
+				return errNotInt
+			}
+			if n <= 0 {
+				return errInvalidExpire("set")
+			}
+			if strings.ToUpper(args[i]) == "EX" {
+				ttl = time.Duration(n) * time.Second
+			} else {
+				ttl = time.Duration(n) * time.Millisecond
+			}
+			hasTTL = true
+			i++ // skip the number we just consumed
+		case "NX":
+			if cond == SetIfExists {
+				return errSyntax // NX and XX together make no sense
+			}
+			cond = SetIfNotExists
+		case "XX":
+			if cond == SetIfNotExists {
+				return errSyntax
+			}
+			cond = SetIfExists
+		default:
+			return errSyntax
+		}
+	}
+
+	if !s.Set(key, val, ttl, cond) {
+		return NullBulk() // NX/XX condition not met: Redis replies (nil)
+	}
+	return OK()
+}
+
+// ---------- Key commands ----------
+
+// DEL key [key ...] -> number of keys actually deleted
+func cmdDel(s *Store, args []string) Value {
+	if len(args) < 1 {
+		return wrongArgs("del")
+	}
+	return Int(int64(s.Del(args...)))
+}
+
+// EXISTS key [key ...] -> how many of them exist
+func cmdExists(s *Store, args []string) Value {
+	if len(args) < 1 {
+		return wrongArgs("exists")
+	}
+	return Int(int64(s.Exists(args...)))
+}
+
+// expireGeneric handles EXPIRE (seconds) and PEXPIRE (milliseconds).
+func expireGeneric(s *Store, args []string, name string, unit time.Duration) Value {
+	if len(args) != 2 {
+		return wrongArgs(name)
+	}
+	n, err := strconv.ParseInt(args[1], 10, 64)
+	if err != nil {
+		return errNotInt
+	}
+	return boolInt(s.Expire(args[0], time.Duration(n)*unit))
+}
+
+// EXPIRE key seconds -> 1 if the timeout was set, 0 if the key doesn't exist
+func cmdExpire(s *Store, args []string) Value {
+	return expireGeneric(s, args, "expire", time.Second)
+}
+
+// PEXPIRE key milliseconds
+func cmdPExpire(s *Store, args []string) Value {
+	return expireGeneric(s, args, "pexpire", time.Millisecond)
+}
+
+// TTL key -> seconds left, -1 if no expiry, -2 if the key doesn't exist
+func cmdTTL(s *Store, args []string) Value {
+	if len(args) != 1 {
+		return wrongArgs("ttl")
+	}
+	ms := s.TTL(args[0])
+	if ms < 0 {
+		return Int(ms) // -1 or -2 pass straight through
+	}
+	// Round to the nearest second, the same way Redis does.
+	return Int((ms + 500) / 1000)
+}
+
+// PTTL key -> like TTL but in milliseconds
+func cmdPTTL(s *Store, args []string) Value {
+	if len(args) != 1 {
+		return wrongArgs("pttl")
+	}
+	return Int(s.TTL(args[0]))
+}
+
+// PERSIST key -> 1 if an expiry was removed, 0 otherwise
+func cmdPersist(s *Store, args []string) Value {
+	if len(args) != 1 {
+		return wrongArgs("persist")
+	}
+	return boolInt(s.Persist(args[0]))
 }
 
 // redis-cli sends "COMMAND DOCS" when it starts, to get help text for
