@@ -2,36 +2,45 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// The database itself (Store) lives in store.go.
-// This file turns parsed commands into calls on the Store and builds replies.
+// The database itself (Store) lives in store.go, persistence in aof.go.
+// This file turns parsed commands into calls on the Store, records writes
+// (propagate), and builds replies.
 
-// A command handler receives the arguments (everything after the command name)
-// and returns the reply to send back.
-type commandFunc func(s *Store, args []string) Value
+type command struct {
+	fn func(srv *Server, args []string) Value
 
-// The command table: name -> handler. Adding a command = adding one line here.
-var commands = map[string]commandFunc{
-	"PING":    cmdPing,
-	"ECHO":    cmdEcho,
-	"SET":     cmdSet,
-	"GET":     cmdGet,
-	"DEL":     cmdDel,
-	"EXISTS":  cmdExists,
-	"EXPIRE":  cmdExpire,
-	"PEXPIRE": cmdPExpire,
-	"TTL":     cmdTTL,
-	"PTTL":    cmdPTTL,
-	"PERSIST": cmdPersist,
-	"COMMAND": cmdCommand,
+	// write = this command can change data. Write commands run one at a time
+	// (see Server.writeMu) so they're logged in exactly the order they happen.
+	write bool
+}
+
+// The command table: name -> handler.
+var commands = map[string]command{
+	"PING":    {fn: cmdPing},
+	"ECHO":    {fn: cmdEcho},
+	"GET":     {fn: cmdGet},
+	"EXISTS":  {fn: cmdExists},
+	"TTL":     {fn: cmdTTL},
+	"PTTL":    {fn: cmdPTTL},
+	"COMMAND": {fn: cmdCommand},
+
+	"SET":       {fn: cmdSet, write: true},
+	"DEL":       {fn: cmdDel, write: true},
+	"EXPIRE":    {fn: cmdExpire, write: true},
+	"PEXPIRE":   {fn: cmdPExpire, write: true},
+	"EXPIREAT":  {fn: cmdExpireAt, write: true},
+	"PEXPIREAT": {fn: cmdPExpireAt, write: true},
+	"PERSIST":   {fn: cmdPersist, write: true},
 }
 
 // dispatch turns a parsed RESP array like ["SET","a","1"] into a reply.
-func dispatch(s *Store, v Value) Value {
+func dispatch(srv *Server, v Value) Value {
 	if v.Type != Array || v.Null || len(v.Array) == 0 {
 		return Err("ERR Protocol error: expected a command array")
 	}
@@ -47,14 +56,19 @@ func dispatch(s *Store, v Value) Value {
 
 	// Commands are case-insensitive: "ping", "PIng" and "PING" all work.
 	name := strings.ToUpper(parts[0])
-	handler, ok := commands[name]
+	cmd, ok := commands[name]
 	if !ok {
 		return Err(fmt.Sprintf("ERR unknown command '%s'", parts[0]))
 	}
-	return handler(s, parts[1:])
+
+	if cmd.write {
+		srv.writeMu.Lock()
+		defer srv.writeMu.Unlock()
+	}
+	return cmd.fn(srv, parts[1:])
 }
 
-// ---------- Shared error replies (same text as real Redis) ----------
+// ---------- Shared helpers and error replies (same text as real Redis) ----------
 
 func wrongArgs(cmd string) Value {
 	return Err(fmt.Sprintf("ERR wrong number of arguments for '%s' command", strings.ToLower(cmd)))
@@ -77,10 +91,24 @@ func boolInt(b bool) Value {
 	return Int(0)
 }
 
+// toDuration converts n units (seconds or milliseconds) to a time.Duration,
+// refusing numbers so big they would overflow.
+func toDuration(n int64, unit time.Duration) (time.Duration, bool) {
+	if n > math.MaxInt64/int64(unit) || n < math.MinInt64/int64(unit) {
+		return 0, false
+	}
+	return time.Duration(n) * unit, true
+}
+
+// unixMs formats a time as Unix milliseconds, the form we write to the AOF.
+func unixMs(t time.Time) string {
+	return strconv.FormatInt(t.UnixMilli(), 10)
+}
+
 // ---------- Basic commands ----------
 
 // PING -> PONG,  PING hello -> "hello"
-func cmdPing(s *Store, args []string) Value {
+func cmdPing(srv *Server, args []string) Value {
 	switch len(args) {
 	case 0:
 		return Simple("PONG")
@@ -92,7 +120,7 @@ func cmdPing(s *Store, args []string) Value {
 }
 
 // ECHO hello -> "hello"
-func cmdEcho(s *Store, args []string) Value {
+func cmdEcho(srv *Server, args []string) Value {
 	if len(args) != 1 {
 		return wrongArgs("echo")
 	}
@@ -100,38 +128,42 @@ func cmdEcho(s *Store, args []string) Value {
 }
 
 // GET key -> value, or (nil) if missing or expired
-func cmdGet(s *Store, args []string) Value {
+func cmdGet(srv *Server, args []string) Value {
 	if len(args) != 1 {
 		return wrongArgs("get")
 	}
-	val, ok := s.Get(args[0])
+	val, ok := srv.store.Get(args[0])
 	if !ok {
 		return NullBulk()
 	}
 	return Bulk(val)
 }
 
-// SET key value [EX seconds | PX milliseconds] [NX | XX]
+// SET key value [EX s | PX ms | EXAT unix-s | PXAT unix-ms] [NX | XX]
 //
 //	SET otp 1234 EX 30   -> expires in 30 seconds
 //	SET lock me NX       -> only if "lock" doesn't exist yet (returns nil if it does)
 //	SET name x XX        -> only if "name" already exists
-func cmdSet(s *Store, args []string) Value {
+//
+// EXAT/PXAT give an absolute time. Mostly used by our own AOF, but real
+// Redis supports them too.
+func cmdSet(srv *Server, args []string) Value {
 	if len(args) < 2 {
 		return wrongArgs("set")
 	}
 	key, val := args[0], args[1]
 
-	var ttl time.Duration
-	hasTTL := false
+	var expireAt time.Time // zero = never expires
+	hasExpiry := false
 	cond := SetAlways
 
 	// Walk through the options after key and value.
 	for i := 2; i < len(args); i++ {
-		switch strings.ToUpper(args[i]) {
-		case "EX", "PX":
-			if hasTTL || i+1 >= len(args) {
-				return errSyntax // EX given twice, EX+PX together, or no number after it
+		opt := strings.ToUpper(args[i])
+		switch opt {
+		case "EX", "PX", "EXAT", "PXAT":
+			if hasExpiry || i+1 >= len(args) {
+				return errSyntax // two expiry options, or no number after it
 			}
 			n, err := strconv.ParseInt(args[i+1], 10, 64)
 			if err != nil {
@@ -140,12 +172,23 @@ func cmdSet(s *Store, args []string) Value {
 			if n <= 0 {
 				return errInvalidExpire("set")
 			}
-			if strings.ToUpper(args[i]) == "EX" {
-				ttl = time.Duration(n) * time.Second
-			} else {
-				ttl = time.Duration(n) * time.Millisecond
+			switch opt {
+			case "EX", "PX":
+				unit := time.Second
+				if opt == "PX" {
+					unit = time.Millisecond
+				}
+				d, ok := toDuration(n, unit)
+				if !ok {
+					return errInvalidExpire("set")
+				}
+				expireAt = srv.store.now().Add(d)
+			case "EXAT":
+				expireAt = time.Unix(n, 0)
+			case "PXAT":
+				expireAt = time.UnixMilli(n)
 			}
-			hasTTL = true
+			hasExpiry = true
 			i++ // skip the number we just consumed
 		case "NX":
 			if cond == SetIfExists {
@@ -162,8 +205,16 @@ func cmdSet(s *Store, args []string) Value {
 		}
 	}
 
-	if !s.Set(key, val, ttl, cond) {
-		return NullBulk() // NX/XX condition not met: Redis replies (nil)
+	if !srv.store.Set(key, val, expireAt, cond) {
+		return NullBulk() // NX/XX condition not met: Redis replies (nil), nothing to log
+	}
+
+	// Log the normalised form: relative EX/PX becomes an absolute PXAT, and
+	// NX/XX are dropped (the condition already passed, replay must just set it).
+	if expireAt.IsZero() {
+		srv.propagate("SET", key, val)
+	} else {
+		srv.propagate("SET", key, val, "PXAT", unixMs(expireAt))
 	}
 	return OK()
 }
@@ -171,23 +222,36 @@ func cmdSet(s *Store, args []string) Value {
 // ---------- Key commands ----------
 
 // DEL key [key ...] -> number of keys actually deleted
-func cmdDel(s *Store, args []string) Value {
+func cmdDel(srv *Server, args []string) Value {
 	if len(args) < 1 {
 		return wrongArgs("del")
 	}
-	return Int(int64(s.Del(args...)))
+	n := srv.store.Del(args...)
+	if n > 0 {
+		srv.propagate(append([]string{"DEL"}, args...)...)
+	}
+	return Int(int64(n))
 }
 
 // EXISTS key [key ...] -> how many of them exist
-func cmdExists(s *Store, args []string) Value {
+func cmdExists(srv *Server, args []string) Value {
 	if len(args) < 1 {
 		return wrongArgs("exists")
 	}
-	return Int(int64(s.Exists(args...)))
+	return Int(int64(srv.store.Exists(args...)))
 }
 
-// expireGeneric handles EXPIRE (seconds) and PEXPIRE (milliseconds).
-func expireGeneric(s *Store, args []string, name string, unit time.Duration) Value {
+// expireAtGeneric sets an absolute expiry and logs it as PEXPIREAT.
+func expireAtGeneric(srv *Server, key string, at time.Time) Value {
+	ok := srv.store.ExpireAt(key, at)
+	if ok {
+		srv.propagate("PEXPIREAT", key, unixMs(at))
+	}
+	return boolInt(ok)
+}
+
+// relativeExpire handles EXPIRE (seconds) and PEXPIRE (milliseconds).
+func relativeExpire(srv *Server, args []string, name string, unit time.Duration) Value {
 	if len(args) != 2 {
 		return wrongArgs(name)
 	}
@@ -195,25 +259,55 @@ func expireGeneric(s *Store, args []string, name string, unit time.Duration) Val
 	if err != nil {
 		return errNotInt
 	}
-	return boolInt(s.Expire(args[0], time.Duration(n)*unit))
+	d, ok := toDuration(n, unit)
+	if !ok {
+		return errInvalidExpire(name)
+	}
+	return expireAtGeneric(srv, args[0], srv.store.now().Add(d))
+}
+
+// absoluteExpire handles EXPIREAT (unix seconds) and PEXPIREAT (unix ms).
+func absoluteExpire(srv *Server, args []string, name string, millis bool) Value {
+	if len(args) != 2 {
+		return wrongArgs(name)
+	}
+	n, err := strconv.ParseInt(args[1], 10, 64)
+	if err != nil {
+		return errNotInt
+	}
+	at := time.Unix(n, 0)
+	if millis {
+		at = time.UnixMilli(n)
+	}
+	return expireAtGeneric(srv, args[0], at)
 }
 
 // EXPIRE key seconds -> 1 if the timeout was set, 0 if the key doesn't exist
-func cmdExpire(s *Store, args []string) Value {
-	return expireGeneric(s, args, "expire", time.Second)
+func cmdExpire(srv *Server, args []string) Value {
+	return relativeExpire(srv, args, "expire", time.Second)
 }
 
 // PEXPIRE key milliseconds
-func cmdPExpire(s *Store, args []string) Value {
-	return expireGeneric(s, args, "pexpire", time.Millisecond)
+func cmdPExpire(srv *Server, args []string) Value {
+	return relativeExpire(srv, args, "pexpire", time.Millisecond)
+}
+
+// EXPIREAT key unix-seconds
+func cmdExpireAt(srv *Server, args []string) Value {
+	return absoluteExpire(srv, args, "expireat", false)
+}
+
+// PEXPIREAT key unix-milliseconds
+func cmdPExpireAt(srv *Server, args []string) Value {
+	return absoluteExpire(srv, args, "pexpireat", true)
 }
 
 // TTL key -> seconds left, -1 if no expiry, -2 if the key doesn't exist
-func cmdTTL(s *Store, args []string) Value {
+func cmdTTL(srv *Server, args []string) Value {
 	if len(args) != 1 {
 		return wrongArgs("ttl")
 	}
-	ms := s.TTL(args[0])
+	ms := srv.store.TTL(args[0])
 	if ms < 0 {
 		return Int(ms) // -1 or -2 pass straight through
 	}
@@ -222,23 +316,27 @@ func cmdTTL(s *Store, args []string) Value {
 }
 
 // PTTL key -> like TTL but in milliseconds
-func cmdPTTL(s *Store, args []string) Value {
+func cmdPTTL(srv *Server, args []string) Value {
 	if len(args) != 1 {
 		return wrongArgs("pttl")
 	}
-	return Int(s.TTL(args[0]))
+	return Int(srv.store.TTL(args[0]))
 }
 
 // PERSIST key -> 1 if an expiry was removed, 0 otherwise
-func cmdPersist(s *Store, args []string) Value {
+func cmdPersist(srv *Server, args []string) Value {
 	if len(args) != 1 {
 		return wrongArgs("persist")
 	}
-	return boolInt(s.Persist(args[0]))
+	ok := srv.store.Persist(args[0])
+	if ok {
+		srv.propagate("PERSIST", args[0])
+	}
+	return boolInt(ok)
 }
 
 // redis-cli sends "COMMAND DOCS" when it starts, to get help text for
 // autocomplete. Replying with an empty array keeps it happy.
-func cmdCommand(s *Store, args []string) Value {
+func cmdCommand(srv *Server, args []string) Value {
 	return ArrayOf()
 }

@@ -26,7 +26,7 @@ func run(s *Store, parts ...string) string {
 	for i, p := range parts {
 		vals[i] = Bulk(p)
 	}
-	return string(dispatch(s, ArrayOf(vals...)).Marshal())
+	return string(dispatch(NewServer(s), ArrayOf(vals...)).Marshal())
 }
 
 func TestKeyExpiresAfterTTL(t *testing.T) {
@@ -145,7 +145,7 @@ func TestSetNXOnlyOneWinner(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if s.Set("lock", "x", 0, SetIfNotExists) {
+			if s.Set("lock", "x", time.Time{}, SetIfNotExists) {
 				mu.Lock()
 				winners++
 				mu.Unlock()

@@ -75,6 +75,13 @@ func (rr *RespReader) Read() (Value, error) {
 	}
 }
 
+// Buffered returns how many bytes have been read from the underlying source
+// but not consumed yet. The AOF loader uses it to work out exactly where the
+// last complete command ended.
+func (rr *RespReader) Buffered() int {
+	return rr.r.Buffered()
+}
+
 // readLine reads up to "\r\n" and returns the text without it.
 func (rr *RespReader) readLine() (string, error) {
 	line, err := rr.r.ReadString('\n')

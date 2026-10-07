@@ -54,7 +54,7 @@ func TestSetGetFlow(t *testing.T) {
 		for i, p := range parts {
 			vals[i] = Bulk(p)
 		}
-		return string(dispatch(s, ArrayOf(vals...)).Marshal())
+		return string(dispatch(NewServer(s), ArrayOf(vals...)).Marshal())
 	}
 
 	cases := []struct {

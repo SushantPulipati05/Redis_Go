@@ -93,14 +93,20 @@ const (
 	SetIfExists                        // XX: only if the key DOES exist
 )
 
-// Set stores key=val. ttl > 0 sets an expiry; ttl == 0 means no expiry
-// (and, like Redis, removes any old expiry). Returns false if NX/XX blocked it.
+// Set stores key=val.
+//
+// expireAt is an ABSOLUTE time ("delete at 10:05:30"), not a duration.
+// The zero time.Time{} means "never expires" (and, like Redis, removes any old
+// expiry). Absolute times matter for persistence: if the AOF stored "EX 10",
+// replaying it after a restart would wrongly give the key a fresh 10 seconds.
+//
+// Returns false if NX/XX blocked the write.
 //
 // The existence check and the write happen under ONE lock. If we checked,
 // unlocked, then locked again to write, two clients doing "SET k v NX" at
 // the same moment could both see "doesn't exist" and both write. That bug
 // is called check-then-act, and holding the lock across both steps prevents it.
-func (s *Store) Set(key, val string, ttl time.Duration, cond SetCondition) bool {
+func (s *Store) Set(key, val string, expireAt time.Time, cond SetCondition) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -112,11 +118,18 @@ func (s *Store) Set(key, val string, ttl time.Duration, cond SetCondition) bool 
 		return false
 	}
 
+	// An expiry time that's already in the past means the key is dead on
+	// arrival (this happens when replaying an old AOF entry).
+	if !expireAt.IsZero() && !s.now().Before(expireAt) {
+		s.deleteKey(key)
+		return true
+	}
+
 	s.data[key] = val
-	if ttl > 0 {
-		s.expires[key] = s.now().Add(ttl)
-	} else {
+	if expireAt.IsZero() {
 		delete(s.expires, key)
+	} else {
+		s.expires[key] = expireAt
 	}
 	return true
 }
@@ -170,19 +183,20 @@ func (s *Store) TTL(key string) int64 {
 	return exp.Sub(s.now()).Milliseconds()
 }
 
-// Expire sets a timeout on an existing key. Returns false if the key doesn't
-// exist. A timeout <= 0 deletes the key immediately (Redis behaviour).
-func (s *Store) Expire(key string, ttl time.Duration) bool {
+// ExpireAt makes an existing key expire at an absolute time. Returns false if
+// the key doesn't exist. A time that's already passed deletes the key now
+// (Redis behaviour for EXPIRE with 0 or a negative number).
+func (s *Store) ExpireAt(key string, at time.Time) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.exists(key) {
 		return false
 	}
-	if ttl <= 0 {
+	if !s.now().Before(at) {
 		s.deleteKey(key)
 		return true
 	}
-	s.expires[key] = s.now().Add(ttl)
+	s.expires[key] = at
 	return true
 }
 

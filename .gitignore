@@ -1,0 +1,7 @@
+# Data files written by the server
+*.aof
+
+# Built binaries
+redis_go
+redis-go
+*.exe
