@@ -19,8 +19,10 @@ func startLeader(t *testing.T) (*Server, string) {
 	}
 	t.Cleanup(func() { ln.Close() })
 	srv.port = ln.Addr().(*net.TCPAddr).Port
+	srv.addr = ln.Addr().String()
 	go srv.Serve(ln)
-	go srv.heartbeatLoop()
+	srv.startLeaderLoops()
+	t.Cleanup(srv.Stop)
 	return srv, ln.Addr().String()
 }
 
@@ -34,10 +36,12 @@ func startFollower(t *testing.T, leaderAddr string) (*Server, string) {
 	}
 	t.Cleanup(func() { ln.Close() })
 	srv.port = ln.Addr().(*net.TCPAddr).Port
-	srv.leaderAddr = leaderAddr
+	srv.addr = ln.Addr().String()
+	srv.setLeaderAddr(leaderAddr)
 	srv.isReplica.Store(true)
 	go srv.Serve(ln)
-	go srv.runReplicaLink()
+	srv.startReplicaLink()
+	t.Cleanup(srv.Stop)
 	return srv, ln.Addr().String()
 }
 

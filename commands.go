@@ -40,6 +40,16 @@ var commands = map[string]command{
 	"PERSIST":   {fn: cmdPersist, write: true},
 }
 
+// Node-to-node commands used for failover (failover.go). They're added in
+// init() rather than in the table above because they (indirectly) call
+// execute(), which reads the table -- Go doesn't allow a variable's
+// initial value to depend on itself.
+func init() {
+	commands["REPLSTATUS"] = command{fn: cmdReplStatus}
+	commands["REPLVOTE"] = command{fn: cmdReplVote}
+	commands["REPLLEADER"] = command{fn: cmdReplLeader}
+}
+
 // dispatch runs a command sent by a normal client.
 func dispatch(srv *Server, v Value) Value {
 	return execute(srv, v, false)
@@ -80,6 +90,12 @@ func execute(srv *Server, v Value, internal bool) Value {
 	if cmd.write {
 		srv.writeMu.Lock()
 		defer srv.writeMu.Unlock()
+
+		// A leader cut off from the majority of the cluster refuses writes
+		// (see hasQuorumLocked). Same error text as real Redis.
+		if !internal && !srv.isReplica.Load() && !srv.hasQuorumLocked() {
+			return Err("NOREPLICAS Not enough good replicas to write.")
+		}
 	}
 	return cmd.fn(srv, parts[1:])
 }
