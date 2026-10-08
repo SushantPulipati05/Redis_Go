@@ -28,25 +28,26 @@ failover_epoch:1
 | **Replication** | Snapshot + live stream, partial resync from a 1 MB backlog, heartbeats, read-only followers |
 | **Failover** | Raft-inspired elections: epochs, one vote per epoch, majority required, most-up-to-date candidate wins |
 | **Safety** | Leader refuses writes without a majority (`NOREPLICAS`); `WAIT` for synchronous replication |
-| **Verified** | 40 tests under the race detector, incl. kill-the-leader failover and **100,000 random commands compared against real Redis** |
+| **Verified** | 48 tests under the race detector, incl. kill-the-leader failover and **100,000 random commands compared against real Redis** |
 
 ## Quick start
 
 ```bash
 # single server
-go run .
+go run ./cmd/redis-go
 redis-cli -p 6380 SET name sushant
 
 # 3-node cluster with automatic failover
-docker compose up --build
+docker compose up --build        # or: make cluster
 ```
 
 Without Docker, start three terminals:
 
 ```bash
-go run . -port 6380 -peers localhost:6381,localhost:6382
-go run . -port 6381 -replicaof localhost:6380 -peers localhost:6380,localhost:6382
-go run . -port 6382 -replicaof localhost:6380 -peers localhost:6380,localhost:6381
+make build
+bin/redis-go -port 6380 -peers localhost:6381,localhost:6382
+bin/redis-go -port 6381 -replicaof localhost:6380 -peers localhost:6380,localhost:6382
+bin/redis-go -port 6382 -replicaof localhost:6380 -peers localhost:6380,localhost:6381
 ```
 
 Every node of a cluster must be started with `-peers`; a node started without it runs standalone.
@@ -80,17 +81,23 @@ flowchart LR
 
 Every write goes through **one function, `propagate`**, which encodes it once and sends the same bytes to the AOF and to every follower. Writes run one at a time under a single lock, so the AOF, the followers and memory always see the same order. Reads run in parallel.
 
-| File | Responsibility |
-|---|---|
-| `resp.go` | RESP parsing and encoding |
-| `store.go` | the data, expiry (lazy + active), snapshots |
-| `commands.go` | command table, read-only and majority checks |
-| `aof.go` | append-only file, fsync policies, replay and crash recovery |
-| `server.go` | connections, reply buffering, shared server state |
-| `replication.go` | handshake, full/partial resync, live stream, ACKs |
-| `backlog.go` | ring of recent stream bytes for partial resync |
-| `failover.go` | elections, votes, promotion, stepping down |
-| `wait.go` | `WAIT` (synchronous replication on demand) |
+```
+cmd/redis-go/          entry point and flags
+internal/resp/         RESP parsing and encoding
+internal/store/        keyspace, lazy and active expiry
+internal/server/
+  server.go            connections, reply buffering, lifecycle
+  commands.go          command table, read-only and quorum checks
+  keys.go              GET, SET, DEL, EXPIRE, TTL, ...
+  aof.go               append-only file, fsync policies, replay
+  replication.go       leader side: PSYNC, snapshots, stream, quorum
+  follower.go          follower side: handshake, resync, ACKs
+  backlog.go           recent stream bytes for partial resync
+  election.go          failover elections, votes, stepping down
+  wait.go              WAIT
+  info.go              INFO replication
+scripts/bench.sh       redis-benchmark comparison
+```
 
 ## Design decisions and trade-offs
 
@@ -109,8 +116,8 @@ Every write goes through **one function, `propagate`**, which encodes it once an
 ## Testing
 
 ```bash
-go test -race ./...                              # 40 tests, race detector on
-REDIS_ADDR=localhost:6379 go test -run Differential -v   # vs. real Redis
+make test        # 48 tests, race detector on
+make test-diff   # differential test against Redis on localhost:6379
 ```
 
 - **Unit tests** for the parser (partial reads, binary-safe values), expiry (with a fake clock — no sleeping), every command and error message.
@@ -122,7 +129,7 @@ REDIS_ADDR=localhost:6379 go test -run Differential -v   # vs. real Redis
 
 ## Benchmarks
 
-`./bench.sh` runs `redis-benchmark` (50 clients) against this server and against Redis 7.0.15, both with `appendfsync everysec`.
+`make bench` runs `redis-benchmark` (50 clients) against this server and against Redis 7.0.15, both with `appendfsync everysec`.
 Measured on a 2-vCPU Linux VM; numbers will differ on your machine.
 
 | Requests / second | SET | GET |

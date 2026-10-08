@@ -1,98 +1,10 @@
-package main
+package server
 
 import (
-	"net"
 	"strings"
 	"testing"
-	"time"
 )
 
-// ---------- helpers ----------
-
-// startLeader runs a leader on a random free port and returns it + its address.
-func startLeader(t *testing.T) (*Server, string) {
-	t.Helper()
-	srv := NewServer(NewStore())
-	ln, err := net.Listen("tcp", "127.0.0.1:0") // port 0 = "pick any free port"
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { ln.Close() })
-	srv.port = ln.Addr().(*net.TCPAddr).Port
-	srv.addr = ln.Addr().String()
-	go srv.Serve(ln)
-	srv.startLeaderLoops()
-	t.Cleanup(srv.Stop)
-	return srv, ln.Addr().String()
-}
-
-// startFollower runs a follower of leaderAddr on a random free port.
-func startFollower(t *testing.T, leaderAddr string) (*Server, string) {
-	t.Helper()
-	srv := NewServer(NewStore())
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { ln.Close() })
-	srv.port = ln.Addr().(*net.TCPAddr).Port
-	srv.addr = ln.Addr().String()
-	srv.setLeaderAddr(leaderAddr)
-	srv.isReplica.Store(true)
-	go srv.Serve(ln)
-	srv.startReplicaLink()
-	t.Cleanup(srv.Stop)
-	return srv, ln.Addr().String()
-}
-
-// client is a tiny RESP client for tests: send a command, read the reply.
-type client struct {
-	conn   net.Conn
-	reader *RespReader
-}
-
-func dial(t *testing.T, addr string) *client {
-	t.Helper()
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { conn.Close() })
-	return &client{conn: conn, reader: NewRespReader(conn)}
-}
-
-func (c *client) do(t *testing.T, parts ...string) string {
-	t.Helper()
-	vals := make([]Value, len(parts))
-	for i, p := range parts {
-		vals[i] = Bulk(p)
-	}
-	c.conn.Write(ArrayOf(vals...).Marshal())
-	c.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	v, err := c.reader.Read()
-	if err != nil {
-		t.Fatalf("reading reply to %v: %v", parts, err)
-	}
-	return string(v.Marshal())
-}
-
-// eventually retries check until it returns true or 3 seconds pass.
-// Replication is asynchronous, so followers catch up "very soon", not instantly.
-func eventually(t *testing.T, what string, check func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if check() {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("timed out waiting for: %s", what)
-}
-
-// ---------- tests ----------
-
-// Data that existed BEFORE the follower connected arrives via the snapshot.
 func TestFollowerGetsSnapshot(t *testing.T) {
 	_, leaderAddr := startLeader(t)
 	leader := dial(t, leaderAddr)
@@ -111,7 +23,6 @@ func TestFollowerGetsSnapshot(t *testing.T) {
 	}
 }
 
-// Writes made AFTER the follower connected arrive via the live stream.
 func TestFollowerGetsLiveWrites(t *testing.T) {
 	_, leaderAddr := startLeader(t)
 	follower, followerAddr := startFollower(t, leaderAddr)
@@ -131,7 +42,6 @@ func TestFollowerGetsLiveWrites(t *testing.T) {
 	})
 }
 
-// Clients can read from a follower but not write to it.
 func TestFollowerIsReadOnly(t *testing.T) {
 	_, leaderAddr := startLeader(t)
 	follower, followerAddr := startFollower(t, leaderAddr)
@@ -147,8 +57,6 @@ func TestFollowerIsReadOnly(t *testing.T) {
 	}
 }
 
-// After the follower applies everything, its offset equals the leader's.
-// That's how we'll know a follower is fully caught up (Day 5).
 func TestOffsetsMatchWhenCaughtUp(t *testing.T) {
 	leaderSrv, leaderAddr := startLeader(t)
 	follower, _ := startFollower(t, leaderAddr)
@@ -166,7 +74,6 @@ func TestOffsetsMatchWhenCaughtUp(t *testing.T) {
 	}
 }
 
-// Two followers both receive every write.
 func TestTwoFollowers(t *testing.T) {
 	leaderSrv, leaderAddr := startLeader(t)
 	f1srv, f1addr := startFollower(t, leaderAddr)
@@ -188,23 +95,19 @@ func TestTwoFollowers(t *testing.T) {
 	_ = leaderSrv
 }
 
-// If the follower's connection drops, it reconnects and resyncs on its own.
 func TestFollowerReconnects(t *testing.T) {
 	leaderSrv, leaderAddr := startLeader(t)
 	follower, followerAddr := startFollower(t, leaderAddr)
 	eventually(t, "follower link up", follower.linkUp.Load)
 
-	// Simulate a network failure: the leader drops every follower connection.
 	leaderSrv.writeMu.Lock()
 	for r := range leaderSrv.replicas {
 		leaderSrv.removeReplicaLocked(r)
 	}
 	leaderSrv.writeMu.Unlock()
 
-	// A write while the follower is disconnected...
 	dial(t, leaderAddr).do(t, "SET", "missed", "while-down")
 
-	// ...still reaches it after it reconnects (via the fresh snapshot).
 	f := dial(t, followerAddr)
 	eventually(t, "follower catches up after reconnect", func() bool {
 		return f.do(t, "GET", "missed") == "$10\r\nwhile-down\r\n"

@@ -1,15 +1,5 @@
-package main
-
-// RESP = REdis Serialization Protocol: the format clients and Redis use to talk.
-//
-//   +OK\r\n                 simple string
-//   -ERR message\r\n        error
-//   :42\r\n                 integer
-//   $5\r\nhello\r\n         bulk string (length-prefixed, can hold any bytes)
-//   $-1\r\n                 null bulk string ("no value")
-//   *2\r\n$3\r\nGET\r\n$1\r\na\r\n   array of 2 bulk strings  ->  ["GET", "a"]
-//
-// Clients always send commands as an array of bulk strings.
+// Package resp implements the Redis serialization protocol (RESP2).
+package resp
 
 import (
 	"bufio"
@@ -20,64 +10,59 @@ import (
 	"strings"
 )
 
-// The first byte of every RESP value says what type it is.
+// Type is the first byte of a RESP value.
+type Type byte
+
 const (
-	SimpleString = '+'
-	Error        = '-'
-	Integer      = ':'
-	BulkString   = '$'
-	Array        = '*'
+	SimpleString Type = '+'
+	Error        Type = '-'
+	Integer      Type = ':'
+	BulkString   Type = '$'
+	Array        Type = '*'
 )
 
-// Safety limits so a broken or malicious client can't make us allocate huge memory.
 const (
-	maxBulkLen  = 512 * 1024 * 1024 // 512 MB, same as real Redis
+	maxBulkLen  = 512 * 1024 * 1024
 	maxArrayLen = 1024 * 1024
 )
 
-// Value is one RESP value. Only the fields that match Type are used.
+// Value is a single RESP value. Only the fields relevant to Type are set.
 type Value struct {
-	Type  byte
-	Str   string  // for SimpleString, Error, BulkString
-	Num   int64   // for Integer
-	Array []Value // for Array
-	Null  bool    // true for $-1 (null bulk) or *-1 (null array)
+	Type  Type
+	Str   string
+	Num   int64
+	Array []Value
+	Null  bool
 }
 
-// ---------- Reading (parsing what the client sent) ----------
-
-// RespReader wraps the connection in a bufio.Reader.
-// Why buffered? TCP is a *stream*: one conn.Read may return half a command,
-// or two commands glued together. bufio lets us read "exactly one line" or
-// "exactly N bytes" no matter how the bytes arrived.
-type RespReader struct {
+// Reader reads RESP values from a stream. It is buffered, so a value split
+// across several TCP reads, or several values in one read, are handled.
+type Reader struct {
 	r *bufio.Reader
 }
 
-func NewRespReader(rd io.Reader) *RespReader {
-	return &RespReader{r: bufio.NewReader(rd)}
+func NewReader(rd io.Reader) *Reader {
+	return &Reader{r: bufio.NewReader(rd)}
 }
 
-// Read parses and returns exactly one complete RESP value.
-func (rr *RespReader) Read() (Value, error) {
-	typ, err := rr.r.ReadByte()
+// Read returns the next complete value.
+func (rr *Reader) Read() (Value, error) {
+	b, err := rr.r.ReadByte()
 	if err != nil {
-		return Value{}, err // io.EOF here = client disconnected cleanly
+		return Value{}, err
 	}
 
-	switch typ {
+	switch t := Type(b); t {
 	case Array:
 		return rr.readArray()
 	case BulkString:
 		return rr.readBulk()
 	case SimpleString, Error:
-		// +OK / -ERR ... : the rest of the line is the text.
-		// Clients never send these, but a follower reads them from its leader.
 		line, err := rr.readLine()
 		if err != nil {
 			return Value{}, err
 		}
-		return Value{Type: typ, Str: line}, nil
+		return Value{Type: t, Str: line}, nil
 	case Integer:
 		line, err := rr.readLine()
 		if err != nil {
@@ -89,19 +74,16 @@ func (rr *RespReader) Read() (Value, error) {
 		}
 		return Value{Type: Integer, Num: n}, nil
 	default:
-		return Value{}, fmt.Errorf("unknown RESP type byte %q", typ)
+		return Value{}, fmt.Errorf("unknown RESP type byte %q", b)
 	}
 }
 
-// Buffered returns how many bytes have been read from the underlying source
-// but not consumed yet. The AOF loader uses it to work out exactly where the
-// last complete command ended.
-func (rr *RespReader) Buffered() int {
+// Buffered returns the number of bytes read from the source but not yet consumed.
+func (rr *Reader) Buffered() int {
 	return rr.r.Buffered()
 }
 
-// readLine reads up to "\r\n" and returns the text without it.
-func (rr *RespReader) readLine() (string, error) {
+func (rr *Reader) readLine() (string, error) {
 	line, err := rr.r.ReadString('\n')
 	if err != nil {
 		return "", err
@@ -112,8 +94,7 @@ func (rr *RespReader) readLine() (string, error) {
 	return line[:len(line)-2], nil
 }
 
-// readInt reads a line like "3" and converts it to a number.
-func (rr *RespReader) readInt() (int, error) {
+func (rr *Reader) readInt() (int, error) {
 	line, err := rr.readLine()
 	if err != nil {
 		return 0, err
@@ -125,8 +106,7 @@ func (rr *RespReader) readInt() (int, error) {
 	return n, nil
 }
 
-// readArray handles "*<count>\r\n" followed by <count> values.
-func (rr *RespReader) readArray() (Value, error) {
+func (rr *Reader) readArray() (Value, error) {
 	count, err := rr.readInt()
 	if err != nil {
 		return Value{}, err
@@ -140,7 +120,6 @@ func (rr *RespReader) readArray() (Value, error) {
 
 	items := make([]Value, 0, count)
 	for i := 0; i < count; i++ {
-		// Each element is itself a RESP value, so we call Read recursively.
 		v, err := rr.Read()
 		if err != nil {
 			return Value{}, err
@@ -150,8 +129,9 @@ func (rr *RespReader) readArray() (Value, error) {
 	return Value{Type: Array, Array: items}, nil
 }
 
-// readBulk handles "$<length>\r\n<exactly length bytes>\r\n".
-func (rr *RespReader) readBulk() (Value, error) {
+// readBulk reads by length rather than scanning for \r\n, so values may
+// contain arbitrary bytes.
+func (rr *Reader) readBulk() (Value, error) {
 	length, err := rr.readInt()
 	if err != nil {
 		return Value{}, err
@@ -163,9 +143,6 @@ func (rr *RespReader) readBulk() (Value, error) {
 		return Value{}, fmt.Errorf("invalid bulk length %d", length)
 	}
 
-	// Read exactly length bytes + the trailing \r\n.
-	// We use the length (not "read until \r\n") because the data itself
-	// may contain \r\n — that's why it's called "binary safe".
 	buf := make([]byte, length+2)
 	if _, err := io.ReadFull(rr.r, buf); err != nil {
 		return Value{}, err
@@ -176,9 +153,7 @@ func (rr *RespReader) readBulk() (Value, error) {
 	return Value{Type: BulkString, Str: string(buf[:length])}, nil
 }
 
-// ---------- Writing (turning a reply into bytes) ----------
-
-// Marshal converts a Value into RESP bytes ready to send.
+// Marshal encodes v in wire format.
 func (v Value) Marshal() []byte {
 	switch v.Type {
 	case SimpleString:
@@ -206,7 +181,6 @@ func (v Value) Marshal() []byte {
 	}
 }
 
-// Small helpers so command code reads nicely: return OK(), Bulk("x"), ...
 func OK() Value                 { return Value{Type: SimpleString, Str: "OK"} }
 func Simple(s string) Value     { return Value{Type: SimpleString, Str: s} }
 func Err(msg string) Value      { return Value{Type: Error, Str: msg} }
@@ -214,3 +188,20 @@ func Int(n int64) Value         { return Value{Type: Integer, Num: n} }
 func Bulk(s string) Value       { return Value{Type: BulkString, Str: s} }
 func NullBulk() Value           { return Value{Type: BulkString, Null: true} }
 func ArrayOf(vs ...Value) Value { return Value{Type: Array, Array: vs} }
+
+// Command encodes a command as an array of bulk strings.
+func Command(args ...string) []byte {
+	vals := make([]Value, len(args))
+	for i, a := range args {
+		vals[i] = Bulk(a)
+	}
+	return ArrayOf(vals...).Marshal()
+}
+
+// Name returns the upper-cased command name of v, or "" if v is not a command.
+func (v Value) Name() string {
+	if v.Type != Array || len(v.Array) == 0 || v.Array[0].Type != BulkString {
+		return ""
+	}
+	return strings.ToUpper(v.Array[0].Str)
+}

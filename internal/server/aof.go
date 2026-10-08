@@ -1,15 +1,4 @@
-package main
-
-// AOF = Append-Only File: our persistence.
-//
-// Every write command is appended to a file, in the same RESP format clients
-// use. On startup we replay the file from the top, which rebuilds the exact
-// same data. The file for "SET name sushant" then "DEL name" literally contains:
-//
-//   *3\r\n$3\r\nSET\r\n$4\r\nname\r\n$7\r\nsushant\r\n
-//   *2\r\n$3\r\nDEL\r\n$4\r\nname\r\n
-//
-// Reusing RESP means the loader is just our existing parser + dispatch.
+package server
 
 import (
 	"bufio"
@@ -21,17 +10,11 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"github.com/SushantPulipati05/Redis_Go/internal/resp"
 )
 
-// FsyncPolicy decides how often we force data from memory onto the disk.
-//
-// Writing to a file normally only reaches the OS's memory cache; the OS saves
-// it to disk "later". fsync (file.Sync) forces it onto the disk *now*, but it's
-// slow (often milliseconds). So it's a trade-off between safety and speed:
-//
-//	always   - fsync after every write: lose nothing on a crash, but slowest
-//	everysec - fsync once per second: lose at most ~1s of writes (Redis default)
-//	no       - let the OS decide: fastest, could lose ~30s on a power cut
+// FsyncPolicy controls how often the AOF is forced to disk.
 type FsyncPolicy string
 
 const (
@@ -48,18 +31,17 @@ func ParseFsyncPolicy(s string) (FsyncPolicy, error) {
 	return "", fmt.Errorf("invalid appendfsync %q (use always, everysec or no)", s)
 }
 
+// AOF is an append-only log of write commands, stored in RESP format.
 type AOF struct {
 	mu     sync.Mutex
 	file   *os.File
-	w      *bufio.Writer // collects small writes in memory, then writes them in bulk
+	w      *bufio.Writer
 	policy FsyncPolicy
-	done   chan struct{} // closed to stop the background fsync goroutine
+	done   chan struct{}
 	closed bool
 }
 
-// OpenAOF opens (or creates) the file for appending.
 func OpenAOF(path string, policy FsyncPolicy) (*AOF, error) {
-	// O_APPEND: every write goes to the end of the file, never overwriting.
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return nil, err
@@ -76,8 +58,6 @@ func OpenAOF(path string, policy FsyncPolicy) (*AOF, error) {
 	return a, nil
 }
 
-// Append writes one command (already encoded as RESP bytes) to the log.
-// The caller encodes once and sends the same bytes to the AOF and to replicas.
 func (a *AOF) Append(cmd []byte) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -93,23 +73,20 @@ func (a *AOF) Append(cmd []byte) error {
 	return nil
 }
 
-// Reset empties the file. A follower calls this before loading a fresh
-// snapshot from its leader: its old history no longer matters.
+// Reset truncates the log. Used by a follower before a full resync.
 func (a *AOF) Reset() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.closed {
 		return errors.New("aof is closed")
 	}
-	a.w.Reset(a.file) // throw away anything still buffered
+	a.w.Reset(a.file)
 	if err := a.file.Truncate(0); err != nil {
 		return err
 	}
 	return a.file.Sync()
 }
 
-// flushAndSync pushes buffered bytes to the OS, then forces them to disk.
-// Caller must hold a.mu.
 func (a *AOF) flushAndSync() error {
 	if err := a.w.Flush(); err != nil {
 		return err
@@ -136,7 +113,6 @@ func (a *AOF) syncEverySecond() {
 	}
 }
 
-// Close flushes everything to disk and closes the file. Call on shutdown.
 func (a *AOF) Close() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -152,14 +128,10 @@ func (a *AOF) Close() error {
 	return err
 }
 
-// LoadAOF replays the file into srv and returns how many commands it ran.
-// A missing file is fine: it just means a fresh start.
-//
-// Crash safety: if the server died halfway through writing the LAST command,
-// the file ends with a partial command. That write never fully reached the
-// disk, so we drop the fragment, cut it off the file, and start normally. Real Redis does the same (aof-load-truncated yes).
-// Garbage in the MIDDLE of the file is different: that's real corruption, so
-// we refuse to start rather than silently lose data.
+// LoadAOF replays the log at path into srv and returns the number of commands
+// applied. A missing file is not an error. An incomplete final command (a
+// crash mid-write) is dropped and cut from the file; anything else that
+// fails to parse is treated as corruption.
 func LoadAOF(path string, srv *Server) (int, error) {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -170,19 +142,18 @@ func LoadAOF(path string, srv *Server) (int, error) {
 	}
 
 	src := bytes.NewReader(data)
-	reader := NewRespReader(src)
-	good := 0 // byte offset where the last complete command ended
+	reader := resp.NewReader(src)
+	good := 0 // offset just past the last complete command
 	count := 0
 
 	for {
 		cmd, err := reader.Read()
 		if err != nil {
 			if good == len(data) && errors.Is(err, io.EOF) {
-				return count, nil // read everything cleanly
+				return count, nil
 			}
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				log.Printf("AOF: last command was incomplete (crash during write?); "+
-					"dropping %d trailing bytes", len(data)-good)
+				log.Printf("AOF: dropping %d bytes of an incomplete final command", len(data)-good)
 				if terr := os.Truncate(path, int64(good)); terr != nil {
 					return count, terr
 				}
@@ -191,12 +162,11 @@ func LoadAOF(path string, srv *Server) (int, error) {
 			return count, fmt.Errorf("AOF corrupted at byte %d: %w", good, err)
 		}
 
-		if reply := execute(srv, cmd, true); reply.Type == Error {
+		if reply := execute(srv, cmd, true); reply.Type == resp.Error {
 			return count, fmt.Errorf("AOF command at byte %d failed: %s", good, reply.Str)
 		}
 		count++
 
-		// Everything not still waiting in a buffer has been consumed.
 		good = len(data) - src.Len() - reader.Buffered()
 	}
 }

@@ -1,4 +1,4 @@
-package main
+package server
 
 import (
 	"strings"
@@ -6,7 +6,6 @@ import (
 	"time"
 )
 
-// With 2 followers connected, WAIT 2 returns 2: the write is on 3 nodes.
 func TestWaitReturnsWhenFollowersHaveWrite(t *testing.T) {
 	_, leaderAddr := startLeader(t)
 	f1, _ := startFollower(t, leaderAddr)
@@ -22,7 +21,6 @@ func TestWaitReturnsWhenFollowersHaveWrite(t *testing.T) {
 	if took := time.Since(start); took > 500*time.Millisecond {
 		t.Errorf("WAIT took %v; should return as soon as followers ACK", took)
 	}
-	// And they really have it.
 	for _, f := range []*Server{f1, f2} {
 		if v, _ := f.store.Get("balance"); v != "500" {
 			t.Errorf("follower missing the write, got %q", v)
@@ -30,8 +28,6 @@ func TestWaitReturnsWhenFollowersHaveWrite(t *testing.T) {
 	}
 }
 
-// Asking for more followers than exist: waits for the timeout, then returns
-// how many DO have it, so the client knows the write isn't fully safe.
 func TestWaitTimesOut(t *testing.T) {
 	_, leaderAddr := startLeader(t)
 	f, _ := startFollower(t, leaderAddr)
@@ -64,7 +60,6 @@ func TestWaitOnFollowerIsAnError(t *testing.T) {
 	}
 }
 
-// GETACK in the stream must keep leader and follower offsets in step.
 func TestOffsetsStillMatchAfterWait(t *testing.T) {
 	leader, leaderAddr := startLeader(t)
 	f, _ := startFollower(t, leaderAddr)

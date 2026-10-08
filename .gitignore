@@ -1,13 +1,10 @@
 # Data files written by the server
 *.aof
 
-# Built binaries
-redis_go
-redis-go
+# Build output
+bin/
+/redis-go
+/Redis_Go
 *.exe
 
-# go build output (binary is named after the module)
-Redis_Go
-
-# Files the Claude app saves here (e.g. resumes) - keep them out of the public repo
 Claude outputs/

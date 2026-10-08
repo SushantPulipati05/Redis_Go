@@ -1,26 +1,15 @@
-package main
-
-// Differential testing: send the SAME random commands to our server and to
-// real Redis, and check that every reply is identical.
-//
-// This catches mistakes no hand-written test would think of: wrong error
-// text, wrong counts for duplicate keys, option edge cases, and so on.
-//
-// It only runs when you point it at a real Redis:
-//
-//	REDIS_ADDR=localhost:6379 go test -run Differential -v
-//
-// It uses database 15 on the real Redis (SELECT 15) and empties it first,
-// so your normal data in database 0 is left alone.
+package server
 
 import (
 	"fmt"
-	"math/rand"
 	"net"
 	"os"
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/SushantPulipati05/Redis_Go/internal/resp"
+	"math/rand"
 )
 
 func TestDifferentialAgainstRealRedis(t *testing.T) {
@@ -29,17 +18,15 @@ func TestDifferentialAgainstRealRedis(t *testing.T) {
 		t.Skip("set REDIS_ADDR=host:port to compare against a real Redis")
 	}
 
-	// Our server, running in-process on a random port.
 	_, ourAddr := startLeader(t)
 	ours := dial(t, ourAddr)
 
-	// Real Redis, in its own database so we don't touch real data.
 	conn, err := net.Dial("tcp", redisAddr)
 	if err != nil {
 		t.Fatalf("can't reach Redis at %s: %v", redisAddr, err)
 	}
 	t.Cleanup(func() { conn.Close() })
-	real := &client{conn: conn, reader: NewRespReader(conn)}
+	real := &client{conn: conn, reader: resp.NewReader(conn)}
 	real.do(t, "SELECT", "15")
 	real.do(t, "FLUSHDB")
 
@@ -67,8 +54,6 @@ func TestDifferentialAgainstRealRedis(t *testing.T) {
 	}
 }
 
-// A small key space, so commands keep hitting the same keys and interact
-// (SET then GET then DEL then EXISTS ...), which is where bugs hide.
 var diffKeys = []string{"a", "b", "c", "d", "user:1", "user:2", "otp", "x"}
 
 func randomCommand(rng *rand.Rand) []string {
@@ -77,8 +62,6 @@ func randomCommand(rng *rand.Rand) []string {
 		vals := []string{"1", "hello", "", "with space", "line\r\nbreak", "ünïcödé", strconv.Itoa(rng.Intn(1000))}
 		return vals[rng.Intn(len(vals))]
 	}
-	// Long expiries only: nothing should actually expire during the run,
-	// otherwise timing differences between the two servers would show up.
 	secs := func() string { return strconv.Itoa(1000 + rng.Intn(9000)) }
 
 	switch rng.Intn(20) {
@@ -93,7 +76,6 @@ func randomCommand(rng *rand.Rand) []string {
 	case 6:
 		return []string{"SET", key(), val(), "XX"}
 	case 7:
-		// Deliberately bad commands: the error text must match too.
 		bad := [][]string{
 			{"SET", key(), val(), "EX", "0"},
 			{"SET", key(), val(), "EX", "abc"},
@@ -133,9 +115,6 @@ func randomCommand(rng *rand.Rand) []string {
 	}
 }
 
-// repliesMatch compares replies exactly, except remaining TTLs: the two
-// servers read the clock at slightly different moments, so a TTL may
-// differ by a tiny amount. Special values (-1, -2) must match exactly.
 func repliesMatch(cmd []string, got, want string) bool {
 	if got == want {
 		return true
@@ -153,9 +132,9 @@ func repliesMatch(cmd []string, got, want string) bool {
 	if g < 0 || w < 0 {
 		return g == w
 	}
-	tolerance := int64(1) // seconds
+	tolerance := int64(1)
 	if cmd[0] == "PTTL" {
-		tolerance = 250 // milliseconds
+		tolerance = 250
 	}
 	d := g - w
 	return d >= -tolerance && d <= tolerance

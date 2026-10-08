@@ -1,4 +1,4 @@
-package main
+package server
 
 import (
 	"os"
@@ -6,23 +6,15 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/SushantPulipati05/Redis_Go/internal/store"
 )
 
-// runOn sends one command to a full Server (so writes reach its AOF).
-func runOn(srv *Server, parts ...string) string {
-	vals := make([]Value, len(parts))
-	for i, p := range parts {
-		vals[i] = Bulk(p)
-	}
-	return string(dispatch(srv, ArrayOf(vals...)).Marshal())
-}
-
-// newServerWithAOF builds a server with a fake clock, logging to path.
 func newServerWithAOF(t *testing.T, path string, clock *fakeClock) *Server {
 	t.Helper()
-	store := NewStore()
-	store.now = clock.now
-	srv := NewServer(store)
+	store := store.New()
+	store.SetClock(clock.now)
+	srv := newServer(store)
 	if _, err := LoadAOF(path, srv); err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -34,7 +26,6 @@ func newServerWithAOF(t *testing.T, path string, clock *fakeClock) *Server {
 	return srv
 }
 
-// Data written before a "restart" must be there after it.
 func TestAOFSurvivesRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.aof")
 	clock := &fakeClock{t: time.Unix(1_000_000, 0)}
@@ -44,13 +35,12 @@ func TestAOFSurvivesRestart(t *testing.T) {
 	runOn(srv, "SET", "temp", "x")
 	runOn(srv, "DEL", "temp")
 	runOn(srv, "SET", "lock", "a", "NX")
-	runOn(srv, "SET", "lock", "b", "NX") // rejected: must NOT be logged
+	runOn(srv, "SET", "lock", "b", "NX")
 	runOn(srv, "SET", "city", "pune")
 	runOn(srv, "EXPIRE", "city", "100")
 	runOn(srv, "PERSIST", "city")
 	srv.aof.Close()
 
-	// "Restart": brand-new server, same file.
 	srv2 := newServerWithAOF(t, path, clock)
 	defer srv2.aof.Close()
 	cases := []struct{ got, want string }{
@@ -66,8 +56,6 @@ func TestAOFSurvivesRestart(t *testing.T) {
 	}
 }
 
-// A key with 100s left that's down for 30s must come back with 70s, not 100s.
-// This is why the AOF stores absolute times (PXAT) instead of "EX 100".
 func TestAOFKeepsAbsoluteExpiry(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.aof")
 	clock := &fakeClock{t: time.Unix(1_000_000, 0)}
@@ -77,7 +65,7 @@ func TestAOFKeepsAbsoluteExpiry(t *testing.T) {
 	runOn(srv, "SET", "short", "x", "EX", "10")
 	srv.aof.Close()
 
-	clock.advance(30 * time.Second) // server was "down" for 30 seconds
+	clock.advance(30 * time.Second)
 
 	srv2 := newServerWithAOF(t, path, clock)
 	defer srv2.aof.Close()
@@ -89,14 +77,13 @@ func TestAOFKeepsAbsoluteExpiry(t *testing.T) {
 	}
 }
 
-// The file stores normalised commands: relative EX becomes absolute PXAT.
 func TestAOFFileContents(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.aof")
 	clock := &fakeClock{t: time.Unix(1_000_000, 0)}
 
 	srv := newServerWithAOF(t, path, clock)
 	runOn(srv, "set", "a", "1", "ex", "5")
-	runOn(srv, "GET", "a") // reads are never logged
+	runOn(srv, "GET", "a")
 	srv.aof.Close()
 
 	data, _ := os.ReadFile(path)
@@ -106,15 +93,13 @@ func TestAOFFileContents(t *testing.T) {
 	}
 }
 
-// Crash in the middle of writing the last command: load what's complete,
-// cut off the fragment, keep going.
 func TestAOFTruncatedTail(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.aof")
 	complete := "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n"
-	partial := "*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$5\r\nhel" // cut off mid-value
+	partial := "*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$5\r\nhel"
 	os.WriteFile(path, []byte(complete+partial), 0o644)
 
-	srv := NewServer(NewStore())
+	srv := newServer(store.New())
 	n, err := LoadAOF(path, srv)
 	if err != nil || n != 1 {
 		t.Fatalf("n=%d err=%v, want 1 command and no error", n, err)
@@ -128,20 +113,19 @@ func TestAOFTruncatedTail(t *testing.T) {
 	}
 }
 
-// Garbage in the middle is real corruption: refuse to start.
 func TestAOFCorruptMiddle(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.aof")
 	content := "*1\r\n$4\r\nPING\r\n" + "garbage\r\n" + "*1\r\n$4\r\nPING\r\n"
 	os.WriteFile(path, []byte(content), 0o644)
 
-	_, err := LoadAOF(path, NewServer(NewStore()))
+	_, err := LoadAOF(path, newServer(store.New()))
 	if err == nil || !strings.Contains(err.Error(), "corrupted at byte 14") {
 		t.Fatalf("expected corruption error at byte 14, got %v", err)
 	}
 }
 
 func TestAOFMissingFileIsFreshStart(t *testing.T) {
-	n, err := LoadAOF(filepath.Join(t.TempDir(), "nope.aof"), NewServer(NewStore()))
+	n, err := LoadAOF(filepath.Join(t.TempDir(), "nope.aof"), newServer(store.New()))
 	if n != 0 || err != nil {
 		t.Fatalf("n=%d err=%v", n, err)
 	}
