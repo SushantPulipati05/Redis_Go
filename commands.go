@@ -29,6 +29,7 @@ var commands = map[string]command{
 	"TTL":     {fn: cmdTTL},
 	"PTTL":    {fn: cmdPTTL},
 	"COMMAND": {fn: cmdCommand},
+	"INFO":    {fn: cmdInfo},
 
 	"SET":       {fn: cmdSet, write: true},
 	"DEL":       {fn: cmdDel, write: true},
@@ -39,8 +40,17 @@ var commands = map[string]command{
 	"PERSIST":   {fn: cmdPersist, write: true},
 }
 
-// dispatch turns a parsed RESP array like ["SET","a","1"] into a reply.
+// dispatch runs a command sent by a normal client.
 func dispatch(srv *Server, v Value) Value {
+	return execute(srv, v, false)
+}
+
+// execute turns a parsed RESP array like ["SET","a","1"] into a reply.
+//
+// internal=true means the command didn't come from a normal client: it's
+// being replayed from the AOF or was sent by our leader. Those are allowed
+// to write even on a read-only follower.
+func execute(srv *Server, v Value, internal bool) Value {
 	if v.Type != Array || v.Null || len(v.Array) == 0 {
 		return Err("ERR Protocol error: expected a command array")
 	}
@@ -59,6 +69,12 @@ func dispatch(srv *Server, v Value) Value {
 	cmd, ok := commands[name]
 	if !ok {
 		return Err(fmt.Sprintf("ERR unknown command '%s'", parts[0]))
+	}
+
+	// Followers are read-only for clients. If clients could write to a
+	// follower, its data would quietly drift away from the leader's.
+	if cmd.write && !internal && srv.isReplica.Load() {
+		return Err("READONLY You can't write against a read only replica.")
 	}
 
 	if cmd.write {
@@ -339,4 +355,13 @@ func cmdPersist(srv *Server, args []string) Value {
 // autocomplete. Replying with an empty array keeps it happy.
 func cmdCommand(srv *Server, args []string) Value {
 	return ArrayOf()
+}
+
+// INFO [replication] -> status text, e.g. role, connected followers, offsets.
+// We only implement the replication section; other sections return it too.
+func cmdInfo(srv *Server, args []string) Value {
+	if len(args) > 1 {
+		return wrongArgs("info")
+	}
+	return Bulk(srv.replicationInfo())
 }

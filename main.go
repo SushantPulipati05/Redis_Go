@@ -1,10 +1,8 @@
 package main
 
 import (
-	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"os"
@@ -14,10 +12,13 @@ import (
 )
 
 func main() {
-	// Command-line options, e.g.:  go run . -port 6381 -aof data.aof -appendfsync always
+	// Command-line options, e.g.:
+	//   go run .                                  leader on 6380
+	//   go run . -port 6381 -replicaof localhost:6380   follower of that leader
 	port := flag.Int("port", 6380, "port to listen on")
-	aofPath := flag.String("aof", "appendonly.aof", "append-only file path (empty string disables persistence)")
+	aofFlag := flag.String("aof", "auto", `append-only file path ("auto" = appendonly-<port>.aof, "" disables persistence)`)
 	fsyncFlag := flag.String("appendfsync", "everysec", "fsync policy: always | everysec | no")
+	replicaOf := flag.String("replicaof", "", `run as a follower of this leader, e.g. "localhost:6380"`)
 	flag.Parse()
 
 	policy, err := ParseFsyncPolicy(*fsyncFlag)
@@ -25,21 +26,29 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// Each server needs its own file: two processes appending to one file
+	// would interleave their writes and corrupt it.
+	aofPath := *aofFlag
+	if aofPath == "auto" {
+		aofPath = fmt.Sprintf("appendonly-%d.aof", *port)
+	}
+
 	store := NewStore()
 	srv := NewServer(store)
+	srv.port = *port
 
 	// Rebuild the data from the AOF BEFORE accepting clients, so nobody
 	// sees a half-loaded database. srv.aof is still nil here, so replayed
 	// commands aren't written to the file a second time.
-	if *aofPath != "" {
+	if aofPath != "" {
 		start := time.Now()
-		n, err := LoadAOF(*aofPath, srv)
+		n, err := LoadAOF(aofPath, srv)
 		if err != nil {
-			log.Fatalf("could not load %s: %v", *aofPath, err)
+			log.Fatalf("could not load %s: %v", aofPath, err)
 		}
-		fmt.Printf("loaded %d commands from %s in %v\n", n, *aofPath, time.Since(start).Round(time.Millisecond))
+		fmt.Printf("loaded %d commands from %s in %v\n", n, aofPath, time.Since(start).Round(time.Millisecond))
 
-		aof, err := OpenAOF(*aofPath, policy)
+		aof, err := OpenAOF(aofPath, policy)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -47,6 +56,16 @@ func main() {
 	}
 
 	go store.RunActiveExpiry()
+
+	if *replicaOf != "" {
+		srv.leaderAddr = *replicaOf
+		srv.isReplica.Store(true)
+		go srv.runReplicaLink()
+		fmt.Printf("role: follower of %s\n", *replicaOf)
+	} else {
+		go srv.heartbeatLoop()
+		fmt.Println("role: leader")
+	}
 
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", *port))
 	if err != nil {
@@ -71,48 +90,5 @@ func main() {
 		os.Exit(0)
 	}()
 
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			if errors.Is(err, net.ErrClosed) {
-				return
-			}
-			fmt.Println("accept error:", err)
-			continue // one bad connection shouldn't kill the server
-		}
-
-		// Serve each client in its own goroutine so many can connect at once.
-		go handleConn(conn, srv)
-	}
-}
-
-// handleConn serves one client until it disconnects.
-func handleConn(conn net.Conn, srv *Server) {
-	defer conn.Close()
-	fmt.Println("client connected:", conn.RemoteAddr())
-
-	reader := NewRespReader(conn)
-
-	for {
-		// Read exactly one full command, however the bytes arrived over TCP.
-		cmd, err := reader.Read()
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				fmt.Println("client disconnected:", conn.RemoteAddr())
-			} else {
-				// Malformed input: tell the client, then drop the connection
-				// (we can't know where the next command starts).
-				conn.Write(Err("ERR Protocol error: " + err.Error()).Marshal())
-				fmt.Println("protocol error from", conn.RemoteAddr(), err)
-			}
-			return
-		}
-
-		reply := dispatch(srv, cmd)
-
-		if _, err := conn.Write(reply.Marshal()); err != nil {
-			fmt.Println("write error:", err)
-			return
-		}
-	}
+	srv.Serve(listener)
 }

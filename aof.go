@@ -76,25 +76,36 @@ func OpenAOF(path string, policy FsyncPolicy) (*AOF, error) {
 	return a, nil
 }
 
-// Append writes one command to the log.
-func (a *AOF) Append(args []string) error {
-	vals := make([]Value, len(args))
-	for i, s := range args {
-		vals[i] = Bulk(s)
-	}
-
+// Append writes one command (already encoded as RESP bytes) to the log.
+// The caller encodes once and sends the same bytes to the AOF and to replicas.
+func (a *AOF) Append(cmd []byte) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.closed {
 		return errors.New("aof is closed")
 	}
-	if _, err := a.w.Write(ArrayOf(vals...).Marshal()); err != nil {
+	if _, err := a.w.Write(cmd); err != nil {
 		return err
 	}
 	if a.policy == FsyncAlways {
 		return a.flushAndSync()
 	}
 	return nil
+}
+
+// Reset empties the file. A follower calls this before loading a fresh
+// snapshot from its leader: its old history no longer matters.
+func (a *AOF) Reset() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.closed {
+		return errors.New("aof is closed")
+	}
+	a.w.Reset(a.file) // throw away anything still buffered
+	if err := a.file.Truncate(0); err != nil {
+		return err
+	}
+	return a.file.Sync()
 }
 
 // flushAndSync pushes buffered bytes to the OS, then forces them to disk.
@@ -180,7 +191,7 @@ func LoadAOF(path string, srv *Server) (int, error) {
 			return count, fmt.Errorf("AOF corrupted at byte %d: %w", good, err)
 		}
 
-		if reply := dispatch(srv, cmd); reply.Type == Error {
+		if reply := execute(srv, cmd, true); reply.Type == Error {
 			return count, fmt.Errorf("AOF command at byte %d failed: %s", good, reply.Str)
 		}
 		count++

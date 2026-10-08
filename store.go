@@ -268,3 +268,35 @@ func (s *Store) RunActiveExpiry() {
 		}
 	}
 }
+
+// ---------- Used by replication ----------
+
+// Flush deletes every key. A follower calls this before loading a fresh
+// snapshot from its leader.
+func (s *Store) Flush() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.data = make(map[string]string)
+	s.expires = make(map[string]time.Time)
+}
+
+// SnapshotRESP returns the whole database as a list of SET commands in RESP
+// format, e.g. "SET name sushant" and "SET otp 1234 PXAT 1791391290425".
+// A new follower replays these to get an exact copy of the data.
+func (s *Store) SnapshotRESP() []byte {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var out []byte
+	for key, val := range s.data {
+		if s.isExpired(key) {
+			continue // don't ship keys that are already dead
+		}
+		cmd := []Value{Bulk("SET"), Bulk(key), Bulk(val)}
+		if exp, has := s.expires[key]; has {
+			cmd = append(cmd, Bulk("PXAT"), Bulk(unixMs(exp)))
+		}
+		out = append(out, ArrayOf(cmd...).Marshal()...)
+	}
+	return out
+}

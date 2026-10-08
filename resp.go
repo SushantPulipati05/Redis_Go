@@ -70,8 +70,26 @@ func (rr *RespReader) Read() (Value, error) {
 		return rr.readArray()
 	case BulkString:
 		return rr.readBulk()
+	case SimpleString, Error:
+		// +OK / -ERR ... : the rest of the line is the text.
+		// Clients never send these, but a follower reads them from its leader.
+		line, err := rr.readLine()
+		if err != nil {
+			return Value{}, err
+		}
+		return Value{Type: typ, Str: line}, nil
+	case Integer:
+		line, err := rr.readLine()
+		if err != nil {
+			return Value{}, err
+		}
+		n, err := strconv.ParseInt(line, 10, 64)
+		if err != nil {
+			return Value{}, fmt.Errorf("invalid integer %q", line)
+		}
+		return Value{Type: Integer, Num: n}, nil
 	default:
-		return Value{}, fmt.Errorf("expected '*' or '$', got %q", typ)
+		return Value{}, fmt.Errorf("unknown RESP type byte %q", typ)
 	}
 }
 
