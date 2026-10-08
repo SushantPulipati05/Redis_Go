@@ -1,0 +1,43 @@
+# A 3-node cluster with automatic failover, in one command:
+#
+#   docker compose up --build
+#
+# Leader on localhost:6380, followers on localhost:6381 and localhost:6382.
+# Kill the leader to watch a failover:   docker compose stop node1
+# Bring it back (it rejoins as a follower): docker compose start node1
+#
+# Inside the Docker network every node listens on 6380 and is reached by its
+# service name (node1:6380, ...). -announce must match what peers list.
+
+x-node: &node
+  build: .
+  restart: unless-stopped
+
+services:
+  node1:
+    <<: *node
+    command: ["-port", "6380", "-announce", "node1:6380",
+              "-peers", "node2:6380,node3:6380", "-aof", "/data/appendonly.aof"]
+    ports: ["6380:6380"]
+    volumes: ["node1-data:/data"]
+
+  node2:
+    <<: *node
+    command: ["-port", "6380", "-announce", "node2:6380", "-replicaof", "node1:6380",
+              "-peers", "node1:6380,node3:6380", "-aof", "/data/appendonly.aof"]
+    ports: ["6381:6380"]
+    volumes: ["node2-data:/data"]
+    depends_on: [node1]
+
+  node3:
+    <<: *node
+    command: ["-port", "6380", "-announce", "node3:6380", "-replicaof", "node1:6380",
+              "-peers", "node1:6380,node2:6380", "-aof", "/data/appendonly.aof"]
+    ports: ["6382:6380"]
+    volumes: ["node3-data:/data"]
+    depends_on: [node1]
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:

@@ -5,3 +5,9 @@
 redis_go
 redis-go
 *.exe
+
+# go build output (binary is named after the module)
+Redis_Go
+
+# Files the Claude app saves here (e.g. resumes) - keep them out of the public repo
+Claude outputs/

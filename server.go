@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"io"
@@ -161,6 +162,23 @@ func (srv *Server) handleConn(conn net.Conn) {
 	reader := NewRespReader(conn)
 	replicaPort := "" // set if this connection says it's a follower (REPLCONF listening-port)
 
+	// Replies go into a buffer instead of straight to the network. If the
+	// client sent several commands at once (pipelining), we answer them all
+	// and send the replies in ONE network write instead of one per command.
+	// We flush as soon as there are no more commands waiting to be read, so
+	// a client sending one command at a time still gets its answer at once.
+	// (Measured: 2-3x more throughput with pipelining. See README.)
+	w := bufio.NewWriter(conn)
+	send := func(v Value) error {
+		if _, err := w.Write(v.Marshal()); err != nil {
+			return err
+		}
+		if reader.Buffered() == 0 {
+			return w.Flush()
+		}
+		return nil
+	}
+
 	for {
 		// Read exactly one full command, however the bytes arrived over TCP.
 		cmd, err := reader.Read()
@@ -168,7 +186,8 @@ func (srv *Server) handleConn(conn net.Conn) {
 			if !errors.Is(err, io.EOF) {
 				// Malformed input: tell the client, then drop the connection
 				// (we can't know where the next command starts).
-				conn.Write(Err("ERR Protocol error: " + err.Error()).Marshal())
+				w.Write(Err("ERR Protocol error: " + err.Error()).Marshal())
+				w.Flush()
 			}
 			return
 		}
@@ -181,18 +200,20 @@ func (srv *Server) handleConn(conn net.Conn) {
 			if len(cmd.Array) == 3 && strings.EqualFold(cmd.Array[1].Str, "listening-port") {
 				replicaPort = cmd.Array[2].Str
 			}
-			conn.Write(OK().Marshal())
+			if send(OK()) != nil {
+				return
+			}
 			continue
 		case "PSYNC":
 			// "PSYNC <replid> <offset>": a follower asking for data, saying
 			// what it already has. From now on this connection is a
 			// replication stream, not a normal client.
 			if srv.isReplica.Load() {
-				conn.Write(Err("ERR this server is a replica and cannot serve PSYNC").Marshal())
+				send(Err("ERR this server is a replica and cannot serve PSYNC"))
 				continue
 			}
 			if len(cmd.Array) != 3 {
-				conn.Write(wrongArgs("psync").Marshal())
+				send(wrongArgs("psync"))
 				continue
 			}
 			reqID := cmd.Array[1].Str
@@ -200,13 +221,14 @@ func (srv *Server) handleConn(conn net.Conn) {
 			if err != nil {
 				reqOffset = -1 // "PSYNC ? -1" = "I have nothing"
 			}
+			if w.Flush() != nil { // send anything still buffered first
+				return
+			}
 			srv.serveReplica(conn, reader, replicaPort, reqID, reqOffset)
 			return
 		}
 
-		reply := dispatch(srv, cmd)
-
-		if _, err := conn.Write(reply.Marshal()); err != nil {
+		if err := send(dispatch(srv, cmd)); err != nil {
 			return
 		}
 	}
