@@ -1,5 +1,7 @@
 # Redis_Go
 
+[![CI](https://github.com/SushantPulipati05/Redis_Go/actions/workflows/ci.yml/badge.svg)](https://github.com/SushantPulipati05/Redis_Go/actions/workflows/ci.yml)
+
 A Redis-compatible, replicated key-value database written from scratch in Go — with **persistence, leader–follower replication, automatic failover, and protection against split-brain writes**.
 
 It speaks the real Redis protocol, so the official `redis-cli`, `redis-benchmark` and Redis client libraries work with it unchanged.
