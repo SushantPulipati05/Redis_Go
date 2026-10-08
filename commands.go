@@ -48,6 +48,7 @@ func init() {
 	commands["REPLSTATUS"] = command{fn: cmdReplStatus}
 	commands["REPLVOTE"] = command{fn: cmdReplVote}
 	commands["REPLLEADER"] = command{fn: cmdReplLeader}
+	commands["WAIT"] = command{fn: cmdWait} // wait.go
 }
 
 // dispatch runs a command sent by a normal client.

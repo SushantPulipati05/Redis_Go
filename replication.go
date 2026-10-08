@@ -102,6 +102,7 @@ func (srv *Server) serveReplica(conn net.Conn, reader *RespReader, port string, 
 				r.ackOffset.Store(off)
 			}
 			r.lastAck.Store(time.Now().UnixNano())
+			srv.notifyAck() // wake up any WAIT commands
 		}
 	}
 	srv.removeReplica(r)
@@ -418,7 +419,8 @@ func (srv *Server) syncWithLeader() error {
 	// Only this goroutine writes to conn now; the loop below only reads.
 	done := make(chan struct{})
 	defer close(done)
-	go srv.sendAcks(conn, done)
+	ackNow := make(chan struct{}, 1) // "send an ACK right away" (for GETACK)
+	go srv.sendAcks(conn, done, ackNow)
 
 	// ---- 3. Apply the live stream ----
 	for {
@@ -429,9 +431,17 @@ func (srv *Server) syncWithLeader() error {
 		}
 		srv.markContact()
 
-		// internal=true: bypasses the READONLY rule; the leader is allowed to write.
-		if reply := execute(srv, cmd, true); reply.Type == Error {
-			log.Printf("replication: command from leader failed: %s", reply.Str)
+		// "REPLCONF GETACK *" = the leader asking "how far are you? answer now"
+		// (sent when a client runs WAIT). It isn't a data command, so we don't
+		// execute it, but it IS part of the stream, so it still counts below.
+		getAck := commandName(cmd) == "REPLCONF" && len(cmd.Array) >= 2 &&
+			strings.EqualFold(cmd.Array[1].Str, "GETACK")
+
+		if !getAck {
+			// internal=true: bypasses the READONLY rule; the leader is allowed to write.
+			if reply := execute(srv, cmd, true); reply.Type == Error {
+				log.Printf("replication: command from leader failed: %s", reply.Str)
+			}
 		}
 
 		// Record it in our own backlog and offset. Re-encoding gives exactly
@@ -441,11 +451,19 @@ func (srv *Server) syncWithLeader() error {
 		srv.backlog.write(raw)
 		srv.replOffset.Add(int64(len(raw)))
 		srv.writeMu.Unlock()
+
+		if getAck {
+			select {
+			case ackNow <- struct{}{}:
+			default: // an immediate ACK is already pending
+			}
+		}
 	}
 }
 
-// sendAcks sends "REPLCONF ACK <offset>" every heartbeatInterval until done.
-func (srv *Server) sendAcks(conn net.Conn, done chan struct{}) {
+// sendAcks sends "REPLCONF ACK <offset>" every heartbeatInterval, and
+// immediately whenever ackNow fires, until done.
+func (srv *Server) sendAcks(conn net.Conn, done, ackNow chan struct{}) {
 	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
 	for {
@@ -458,6 +476,7 @@ func (srv *Server) sendAcks(conn net.Conn, done chan struct{}) {
 		case <-done:
 			return
 		case <-ticker.C:
+		case <-ackNow:
 		}
 	}
 }

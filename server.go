@@ -58,6 +58,11 @@ type Server struct {
 	syncFull    atomic.Int64 // leader stats, shown in INFO
 	syncPartial atomic.Int64
 
+	// ackCh is closed (and replaced) every time a follower ACKs, waking up
+	// every WAIT command at once. See notifyAck / ackChan.
+	ackMu sync.Mutex
+	ackCh chan struct{}
+
 	// ----- Failover (see failover.go) -----
 	peers      []string // the other nodes in the cluster
 	epoch      atomic.Int64
@@ -77,6 +82,7 @@ func NewServer(store *Store) *Server {
 		store:    store,
 		replicas: make(map[*replica]struct{}),
 		backlog:  newBacklog(0),
+		ackCh:    make(chan struct{}),
 	}
 	srv.setReplID(newReplID())
 	srv.setLeaderAddr("")
